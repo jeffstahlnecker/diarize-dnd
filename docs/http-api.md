@@ -168,6 +168,7 @@ All errors use one envelope and an appropriate HTTP status:
 | 413 | `payload_too_large` | Body or upload over the limit. |
 | 415 | `unsupported_media_type` | Upload is not a supported audio container. |
 | 422 | `validation_failed` | Field-level problems, `details.fields` lists them. |
+| 507 | `insufficient_storage` | Archive volume has less than 2 GiB free at start. `details.freeBytes`. |
 | 422 | `capture_failed` | Recorder could not start (permission, device). `details.hint` explains. |
 | 429 | `pairing_rate_limited` | Too many wrong pairing codes; `Retry-After` seconds. |
 | 500 | `internal` | Unexpected; the terminal has the stack. |
@@ -191,7 +192,8 @@ Auth column: **P** = public, **T** = bearer token required.
 | `POST /v1/recordings/{id}/stop` | T | Stop capture; start analysis unless `transcribe` is `manual`. |
 | `POST /v1/recordings/{id}/transcribe` | T | Start analysis of a stopped recording (`manual` mode, retry). |
 | `GET /v1/recordings/{id}/transcript` | T | Transcript with speakers and clock. |
-| `DELETE /v1/recordings/{id}/audio` | T | Delete the raw audio, keep transcript and speakers. |
+| `PATCH /v1/recordings/{id}` | T | Set `title` and/or `clientMeta` (opaque client data, for example consent flags). |
+| `DELETE /v1/recordings/{id}/audio` | T | Delete the raw audio (optionally one channel with `?channel=n`), keep transcript and speakers. |
 | `DELETE /v1/recordings/{id}` | T | Delete audio, transcript and row. Requires `?confirm=true`. |
 | `POST /v1/transcriptions` | T | Upload an audio file for diarization and transcription. |
 | `GET /v1/speakers` | T | Speaker library. |
@@ -244,8 +246,12 @@ Response `200`:
   "defaultLanguage": "de",
   "sources": ["mic", "system"],
   "inputDevices": [
-    { "uid": "BuiltInMicrophoneDevice", "name": "MacBook Pro Microphone", "isDefault": true }
+    { "uid": "BuiltInMicrophoneDevice", "name": "MacBook Pro Microphone", "isDefault": true,
+      "channels": 1, "nominalSampleRate": 48000 },
+    { "uid": "AppleUSBAudioEngine:...", "name": "USB Audio Interface", "isDefault": false,
+      "channels": 8, "nominalSampleRate": 48000 }
   ],
+  "storage": { "archivePath": "/Users/.../archive", "freeBytes": 412316860416 },
   "limits": { "maxUploadBytes": 2147483648, "maxDurationSec": 36000, "jsonBodyBytes": 65536 },
   "features": { "upload": true, "deleteAudio": true, "speakerMerge": true },
   "recording": null,
@@ -253,7 +259,7 @@ Response `200`:
 }
 ```
 
-`recording` is the active recording object (or `null`). `orphans` lists recordings left in `recording` state by a crashed process; `POST .../stop` on one analyses whatever audio was written.
+`inputDevices[].channels` is the number of input channels the device offers (a multi-input interface reports more than 1; see [Multichannel recording](#multichannel-recording)). `storage.freeBytes` is the free space on the archive volume, so a client can warn before a long recording. `recording` is the active recording object (or `null`). `orphans` lists recordings left in `recording` state by a crashed process; `POST .../stop` on one analyses whatever audio was written.
 
 ### `POST /v1/recordings`
 
@@ -266,8 +272,27 @@ Request:
   "sources": ["mic"],
   "micDeviceUID": null,
   "clientRef": "my-app#sitting-3#1731607392000",
+  "clientMeta": { "consent": { "recording": true } },
   "transcribe": "onStop",
   "deleteAudioWhenDone": false
+}
+```
+
+Multichannel request (one input channel per person, see [Multichannel recording](#multichannel-recording)):
+
+```json
+{
+  "title": "Game night",
+  "language": "de",
+  "sources": ["mic"],
+  "micDeviceUID": "AppleUSBAudioEngine:...",
+  "channelMap": [
+    { "channel": 1, "label": "Anna", "key": "pc.anna" },
+    { "channel": 2, "label": "Ben", "key": "pc.ben" },
+    { "channel": 3, "label": "GM", "key": "gm" }
+  ],
+  "captureQuality": "archive",
+  "bleed": "suppress"
 }
 ```
 
@@ -277,11 +302,19 @@ Request:
 | `language` | `auto`, `de`, `en` | configured default | |
 | `sources` | array of `mic`, `system` | `["mic"]` | `system` needs the Screen & System Audio permission. |
 | `micDeviceUID` | string or null | system default | From `capabilities.inputDevices`. |
+| `channelMap` | array, 1..16 entries, optional | absent | Switches on multichannel mode: each entry `{ channel (1-based, unique, at most the device's `channels`), label (string 0..100), key (opaque string 0..100, optional) }`. Unlisted channels are not recorded. Requires `sources: ["mic"]`; otherwise `422 validation_failed`. |
+| `captureQuality` | `asr`, `archive` | `asr` | `asr`: 16 kHz mono Float32 per channel (what the analysis needs; the format the recorder writes today). `archive`: the device's sample rate (up to 48 kHz), 16-bit PCM per channel, for audio that should stay usable beyond transcription; analysis resamples. Multichannel only; ignored (and `asr`) for single-source recordings. |
+| `bleed` | `suppress`, `keep` | `suppress` | Multichannel only: drop segments that are cross-talk from another channel's speaker from the merged transcript (they stay available with `?includeBleed=true`). |
+| `clientMeta` | JSON object, at most 4 KiB serialised | null | Opaque client data stored with the recording (sidecar) and returned on every Recording; the server never interprets it. Change later with `PATCH /v1/recordings/{id}`. |
 | `clientRef` | string 0..200 | null | Opaque tag stored with the recording; filter with `GET /v1/recordings?clientRef=`. |
 | `transcribe` | `onStop`, `manual` | `onStop` | `manual` leaves the audio unanalysed until `POST .../transcribe`. |
 | `deleteAudioWhenDone` | bool | `false` | Delete the raw audio after a successful analysis. Persisted server-side; works even if the client has gone away. |
 
-Response `201`: a [Recording](#recording) with `state: "recording"`. The call returns once capture is running and `audioStartedAt` is known (normally under a second). Errors: `409 conflict_recording_active`, `422 capture_failed`, `422 validation_failed`, `503 models_unavailable` (only when `transcribe` is `onStop` and the models are missing, checked up front).
+Response `201`: a [Recording](#recording) with `state: "recording"`. The call returns once capture is running and `audioStartedAt` is known (normally under a second). Errors: `409 conflict_recording_active`, `422 capture_failed`, `422 validation_failed`, `507 insufficient_storage` (less than 2 GiB free on the archive volume), `503 models_unavailable` (only when `transcribe` is `onStop` and the models are missing, checked up front).
+
+### `PATCH /v1/recordings/{id}`
+
+Body: any of `title` (string 1..200), `clientMeta` (object, replaces the stored value). Allowed in every state. Response `200` with the Recording. This is how a client records a later change, for example a consent flag that a participant grants or withdraws after the session.
 
 ### `POST /v1/recordings/{id}/stop`
 
@@ -321,17 +354,17 @@ Response `200`:
       { "id": "spk_b2", "label": null, "segmentCount": 97, "speechSec": 600.9 }
     ],
     "segments": [
-      { "id": 4401, "start": 12.4, "end": 17.9, "speakerId": "spk_a1", "speakerLabel": "Sam", "text": "...", "confidence": 0.93 }
+      { "id": 4401, "start": 12.4, "end": 17.9, "speakerId": "spk_a1", "speakerLabel": "Sam", "text": "...", "confidence": 0.93, "channel": null, "bleed": false }
     ]
   }
 }
 ```
 
-`transcript` is a superset of the JSON file written by `diarize` (`TranscriptDocument`): the same keys plus `segments[].id`. `409 not_ready` while `state` is `recording` or `analyzing`; `state: "empty"` returns an empty `segments` array.
+`transcript` is a superset of the JSON file written by `diarize` (`TranscriptDocument`): the same keys plus `segments[].id`, `segments[].channel` (1-based input channel for multichannel recordings, else `null`), `segments[].bleed` and `speakers[].channel`. Query `?includeBleed=true` to include segments classified as cross-talk (default: omitted when the recording used `bleed: "suppress"`). `409 not_ready` while `state` is `recording` or `analyzing`; `state: "empty"` returns an empty `segments` array.
 
 ### `DELETE /v1/recordings/{id}/audio`
 
-Removes the raw audio file and marks `audioDeletedAt`, keeping transcript and speaker data (same operation as "Delete Audio" in the app). Idempotent. Not allowed while `state` is `recording` or `analyzing` (`409 wrong_state`). Response `200` with the Recording.
+Removes the raw audio file and marks `audioDeletedAt`, keeping transcript and speaker data (same operation as "Delete Audio" in the app). For a multichannel recording `?channel=n` removes only that channel's file (`channels[n].audioDeletedAt`); without it all channel files and the mixdown go. Raw audio is never deleted unless a client calls this or set `deleteAudioWhenDone`. Idempotent. Not allowed while `state` is `recording` or `analyzing` (`409 wrong_state`). Response `200` with the Recording.
 
 ### `DELETE /v1/recordings/{id}?confirm=true`
 
@@ -377,7 +410,7 @@ event: snapshot
 data: {"serverTime":1731607392123,"recording":{...Recording or null}}
 
 event: levels
-data: {"recordingId":"rec_9f1c","t":1731607400123,"mic":0.42,"system":null}
+data: {"recordingId":"rec_9f1c","t":1731607400123,"mic":0.42,"system":null,"channels":null}
 
 event: state
 data: {"recording":{...Recording}}
@@ -395,7 +428,7 @@ data: {"recordingId":"rec_9f1c","error":{"code":"internal","message":"..."}}
 | Event | When | Notes |
 | --- | --- | --- |
 | `snapshot` | on connect | Current recording (or `null`). |
-| `levels` | about 10 per second while a recording is running | Values 0..1, smoothed, perceptual scale. `null` for a source that is not captured. |
+| `levels` | about 10 per second while a recording is running | Values 0..1, smoothed, perceptual scale. `null` for a source that is not captured. In multichannel mode `channels` is an array of `{ "channel": n, "level": 0..1 }` (and `mic` is the maximum), else `null`. |
 | `state` | every state transition | |
 | `progress` | during analysis, throttled to about one per second | `step` is human readable (English); `fraction` is `null` when the pipeline cannot tell. |
 | `ready` | analysis finished (`done` or `empty`) | Fetch the transcript next. |
@@ -424,6 +457,9 @@ Events carry no transcript text and no audio.
   "hasAudio": true,
   "audioDeletedAt": null,
   "deleteAudioWhenDone": false,
+  "clientMeta": null,
+  "captureQuality": "asr",
+  "channels": null,
   "errorMessage": null,
   "progress": null,
   "clock": {
@@ -440,6 +476,8 @@ Events carry no transcript text and no audio.
 | `state` | `recording`, `stopped` (capture over, analysis not started, only with `transcribe: "manual"`), `analyzing`, `done`, `empty` (no speech found), `failed`. Maps to the app's processing states; `stopped` is derived. |
 | `durationSec` | Live elapsed audio while recording; final audio duration afterwards. |
 | `progress` | `{ "step": string, "fraction": number or null, "t": epoch ms }` during analysis, else `null`. |
+| `clientMeta` | The opaque object given at start or via `PATCH`; `null` if none. |
+| `channels` | `null` for a single-source recording. For multichannel: `[ { "channel": 1, "label": "Anna", "key": "pc.anna", "bytes": 123456, "audioDeletedAt": null } ]`. |
 | `clock` | See [Time and clocks](#time-and-clocks). `syncPoints` only in single-recording and transcript responses. |
 
 ### Speaker
@@ -470,10 +508,31 @@ The server therefore records a `clock` per recording it captures:
 
 All wall-clock values use the macOS system clock; a client on the same machine sees the same clock. If `durationSec` is clearly shorter than `stoppedAt - audioStartedAt` the Mac probably slept during recording; clients should warn.
 
+A multichannel recording has **one** clock: all channels come from one device and one sample stream, so the per-channel files are sample-aligned with each other and share `audioStartedAt` and `syncPoints`.
+
+---
+
+## Multichannel recording
+
+> Status: specified, not yet implemented (additive; single-source recordings behave exactly as above).
+
+Today `diarize` records at most two channels: microphone (left) and system audio (right), analysed independently. Multichannel mode generalises the idea: **one input channel of a multi-input audio device is one person**. It is meant for a table where every participant has their own microphone (headset or lavalier) and the microphones arrive in the Mac as one multi-channel input device (a USB audio interface, a multitrack recorder in USB audio mode, or several devices combined into an aggregate device in Audio MIDI Setup). Hardware is not part of this API; any device that macOS lists as an input with more than one channel works.
+
+- **Discover**: `GET /v1/capabilities` lists `inputDevices[].channels`.
+- **Start**: `POST /v1/recordings` with `micDeviceUID` and `channelMap`. The server validates channels against the device and refuses with `422 validation_failed` (`details.fields`) otherwise.
+- **Capture**: one mono file per mapped channel, `<archive>/recordings/<recording>/ch01.wav` and so on, plus a 16 kHz mono mixdown `mix.wav` (the recording's primary audio file, so existing tools still have something to play). `captureQuality: "asr"` writes 16 kHz Float32 (about 0.23 GB per channel-hour); `"archive"` writes 16-bit PCM at the device rate, at most 48 kHz (about 0.35 GB per channel-hour at 48 kHz), and analysis resamples from it.
+- **Analyse**: each channel is analysed on its own (voice activity, diarization, transcription); the dominant speaker of a channel is that channel's person, further speakers in the same channel (someone leaning into the mic, a guest) get their own speaker ids. The results are merged by time. `segments[].channel` names the channel. Speaker ids still come from the global speaker library, so a voice stays recognisable if a person later uses a different channel.
+- **Cross-talk (bleed)**: with `bleed: "suppress"` a segment is marked `bleed: true` and left out of the merged transcript when, over most of its duration, another channel is clearly louder (short-term level comparison across channels). The segment stays retrievable with `?includeBleed=true`.
+- **Levels and clock**: `levels` events carry per-channel levels; one clock for all channels (see [Time and clocks](#time-and-clocks)).
+- **Delete**: `DELETE /v1/recordings/{id}/audio?channel=n` removes one person's audio only.
+
+Out of scope for the first version: combining multichannel with system audio, more than 16 channels, live (streaming) transcription, per-channel gain or noise processing.
+
 ---
 
 ## Limits and operational notes
 
+- Disk use: single-source `asr` audio is about 0.23 GB per hour (16 kHz Float32); multichannel `archive` audio at 48 kHz/16-bit is about 0.35 GB per channel-hour (a 4 hour recording with 6 channels is about 8.3 GB), and `asr` quality about 5.5 GB for the same session, plus the mixdown. Check `capabilities.storage.freeBytes`.
 - One recording at a time. The check is cross-process (it looks at the database), so it also refuses while the app or CLI is recording.
 - The server serialises analyses (one at a time, like the MCP server); starting several uploads queues them.
 - Microphone permission belongs to the process that runs `diarize serve` (for example Terminal). The first start shows the macOS prompt; if it was denied, `capture_failed` explains where to enable it.
