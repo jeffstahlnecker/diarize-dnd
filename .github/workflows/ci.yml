@@ -12,9 +12,9 @@ concurrency:
 
 jobs:
   build-test:
-    # macos-15 (Apple Silicon) is used instead of macos-14: macos-14 images are being retired.
+    # macos-latest: whatever image GitHub currently maps it to (macos-14 images are being retired).
     # The package's deployment target stays macOS 14.
-    runs-on: macos-15
+    runs-on: macos-latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
