@@ -9,10 +9,11 @@ import NIOCore
 /// Assigns (or echoes a sanitised client-supplied) `X-Request-Id` and puts it on every response.
 struct RequestIDMiddleware<Context: RequestContext>: RouterMiddleware {
     func handle(_ request: Request, context: Context, next: (Request, Context) async throws -> Response) async throws -> Response {
-        var request = request
         let id = Self.sanitised(request.headers[Hdr.requestID]) ?? Self.generate()
-        request.head.headerFields[Hdr.requestID] = id
-        var response = try await next(request, context)
+        var head = request.head
+        head.headerFields[Hdr.requestID] = id
+        let tagged = Request(head: head, body: request.body)
+        var response = try await next(tagged, context)
         response.headers[Hdr.requestID] = id
         return response
     }
