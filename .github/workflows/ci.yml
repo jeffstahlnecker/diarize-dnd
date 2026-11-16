@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "feature/**"]
+  pull_request:
+    branches: [main, "feature/**"]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    # macos-15 (Apple Silicon) is used instead of macos-14: macos-14 images are being retired.
+    # The package's deployment target stays macOS 14.
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select newest installed Xcode 16
+        run: |
+          XC=$(ls -d /Applications/Xcode_16*.app 2>/dev/null | sort -V | tail -1 || true)
+          if [ -n "$XC" ]; then
+            echo "Selecting $XC"
+            sudo xcode-select -s "$XC"
+          else
+            echo "No Xcode 16 found, using default"
+          fi
+          xcodebuild -version
+
+      - name: Cache SwiftPM build
+        uses: actions/cache@v4
+        with:
+          path: .build
+          key: spm-${{ runner.os }}-${{ hashFiles('Package.swift') }}
+          restore-keys: spm-${{ runner.os }}-
+
+      - run: swift --version
+
+      # No existing test needs Core ML models or downloads. If one ever does, skip it
+      # when DIARIZE_SKIP_MODEL_TESTS=1 (set below).
+      - name: Build (including tests)
+        run: swift build --build-tests
+
+      - name: Test
+        env:
+          DIARIZE_SKIP_MODEL_TESTS: "1"
+        run: swift test --parallel

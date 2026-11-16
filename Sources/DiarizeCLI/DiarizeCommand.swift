@@ -14,6 +14,7 @@ struct DiarizeCommand: AsyncParsableCommand {
             ArchiveCommand.self,
             ConfigCommand.self,
             MCPCommand.self,
+            ServeCommand.self,
         ],
         defaultSubcommand: nil
     )
