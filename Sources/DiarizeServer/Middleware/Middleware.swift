@@ -11,7 +11,7 @@ struct RequestIDMiddleware<Context: RequestContext>: RouterMiddleware {
     func handle(_ request: Request, context: Context, next: (Request, Context) async throws -> Response) async throws -> Response {
         var request = request
         let id = Self.sanitised(request.headers[Hdr.requestID]) ?? Self.generate()
-        request.headers[Hdr.requestID] = id
+        request.head.headerFields[Hdr.requestID] = id
         var response = try await next(request, context)
         response.headers[Hdr.requestID] = id
         return response
