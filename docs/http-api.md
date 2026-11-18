@@ -28,9 +28,12 @@ diarize serve --allow-origin https://app.example.com
 
 ```
 diarize serve 0.1.0 (API v1)
-Listening on  http://127.0.0.1:47653
+Archive:          /Users/you/Library/Application Support/diarize/archive
 Allowed origins:  https://app.example.com
-Pairing code:     483-912   (valid 5 minutes, single use)
+Paired clients:   0
+Microphone:       opened only when a paired client starts a recording. Stop the server with Ctrl-C.
+Pairing code:     483-912   (valid until 19:05, single use)
+Listening on      http://127.0.0.1:47653
 ```
 
 A client pairs once, then uses the returned token:
@@ -72,7 +75,7 @@ Environment: `DIARIZE_SERVE_ORIGINS`, `DIARIZE_SERVE_PORT`.
 
 - Base URL: `http://127.0.0.1:<port>/v1`. Use the literal `127.0.0.1` (the server does not listen on `::1`).
 - Requests and responses are UTF-8 JSON (`Content-Type: application/json`) unless stated otherwise. Unknown request fields are ignored; unknown response fields must be ignored by clients.
-- Timestamps are ISO-8601 UTC with millisecond precision (`2026-11-14T19:00:01.214Z`). Fields that exist to align audio with another clock also come as epoch milliseconds (`...Ms`).
+- Timestamps are ISO-8601 UTC with millisecond precision (`2026-11-14T19:00:01.214Z`). Fields that exist to align audio with another clock also come as epoch milliseconds (`...Ms`), and so does the server clock: `serverTime` (ISO) is always accompanied by `serverTimeMs` (epoch ms, same instant), in `/v1/health` and in the SSE `snapshot`. Clients should accept either form for `serverTime` (API v1 previews sent epoch ms in the snapshot).
 - Durations and audio positions are seconds (floating point).
 - IDs are opaque strings: recordings `rec_...`, speakers `spk_...`, segments are integers (stable until the transcript is regenerated).
 - Every response carries `X-Request-Id`. A client may send its own `X-Request-Id` (max 64 chars); it is echoed.
@@ -86,20 +89,21 @@ A web page can call any service on `127.0.0.1`, so the server never trusts the n
 
 1. **Host check**: the `Host` header must be `127.0.0.1:<port>` or `localhost:<port>` (defence against DNS rebinding). Otherwise `403 invalid_host`.
 2. **Origin check**: if the request carries an `Origin` header, it must exactly match an allowed origin. Otherwise `403 forbidden_origin` (and no CORS headers, so the page cannot read the answer). `Origin: null` is rejected. Requests without `Origin` (non-browser clients) are subject to the token check only.
+   A browser therefore cannot tell "not allowed" from "not running" (both are an opaque network error); install help should always show the `--allow-origin` line.
 3. **Bearer token**: `Authorization: Bearer dz_...`. Otherwise `401 unauthorized`.
 
 Public endpoints (no token): `GET /v1/health`, `POST /v1/pair`. They still go through checks 1 and 2.
 
 ### Pairing
 
-On start, `diarize serve` prints a one-time **pairing code** (six digits, `NNN-NNN`). It is valid for 5 minutes and is consumed by the first successful pairing; a new code is printed on every start and after five wrong attempts.
+On start, `diarize serve` prints a one-time **pairing code** (six digits, `NNN-NNN`). It is valid for 5 minutes and is consumed by the first successful pairing; a new code is printed on every start and after five wrong attempts. When a client tries to pair while the current code has expired or was already used, the server prints a fresh code in the terminal and answers `403 pairing_code_invalid`; the user then types the new code. The code never leaves the terminal, and a server that has been running for a while does not need a restart to pair another client.
 
 The client sends the code once and receives a long-lived token:
 
 - Tokens are 256-bit random values with the prefix `dz_`. Only the SHA-256 hash is stored, in `~/.config/diarize/serve-tokens.json` (mode `0600`) together with the token id, the client name, the origin it was issued to, `createdAt` and `lastUsedAt`.
-- A token issued to an origin only works when requests come from that same origin (or carry no `Origin`).
+- A token issued to an origin only works when requests come from that same origin (or carry no `Origin`). A token issued to origin A and sent from origin B, where B is **also allowed**, gets `403 forbidden_origin` **with** CORS headers for B, so the page can read the reason (its token belongs to another address) and offer to pair again.
 - Revoke one token with `DELETE /v1/pair` (the token itself), or all tokens with `diarize serve --revoke-all`.
-- Wrong codes are rate limited: 5 failures invalidate the current code and return `429 pairing_rate_limited` with `Retry-After`.
+- Wrong codes are rate limited: the fifth wrong code invalidates the current code and returns `429 pairing_rate_limited` with `Retry-After: 60`; every attempt during those 60 seconds (even with the new code) gets the same 429. A new code is printed at once.
 - The terminal prints a line for every pairing and for every recording start (`started by "<clientName>" from <origin>`).
 
 The server never opens the microphone, loads models or touches the archive on its own. Capture happens only inside an authenticated `POST /v1/recordings` call, and macOS shows its own microphone indicator while it runs.
@@ -158,12 +162,12 @@ All errors use one envelope and an appropriate HTTP status:
 | --- | --- | --- |
 | 400 | `bad_request` | Malformed JSON, wrong content type. |
 | 401 | `unauthorized` | Missing, unknown or revoked token. Header `WWW-Authenticate: Bearer`. |
-| 403 | `forbidden_origin` | `Origin` not allowed, or token not valid for this origin. |
+| 403 | `forbidden_origin` | `Origin` not allowed (no CORS headers), or token issued to another allowed origin (with CORS headers). |
 | 403 | `invalid_host` | `Host` header is not loopback. |
 | 403 | `pairing_code_invalid` | Wrong, expired or used pairing code. |
 | 404 | `not_found` | Unknown route, recording, speaker. |
-| 409 | `conflict_recording_active` | A recording is already in progress (from this server, the app, or the CLI). |
-| 409 | `wrong_state` | The operation does not fit the recording state (`details.state`). |
+| 409 | `conflict_recording_active` | A recording is already in progress (from this server, the app, the CLI, or an orphan). `details.recordingId` is always set. |
+| 409 | `wrong_state` | The operation does not fit the recording state (`details.state`; `details.reason` is `audio_deleted` or `recording_in_other_process` where it applies). |
 | 409 | `not_ready` | Transcript requested while `state` is `recording` or `analyzing`. |
 | 413 | `payload_too_large` | Body or upload over the limit. |
 | 415 | `unsupported_media_type` | Upload is not a supported audio container. |
@@ -211,11 +215,12 @@ Not in v1 on purpose (use the app, CLI or MCP): folders, search, segment reassig
   "version": "0.1.0",
   "apiVersion": 1,
   "paired": false,
-  "serverTime": "2026-11-14T18:55:00.123Z"
+  "serverTime": "2026-11-14T18:55:00.123Z",
+  "serverTimeMs": 1763146500123
 }
 ```
 
-`paired` is `true` when at least one token exists. Nothing else is revealed without a token.
+`paired` is `true` when at least one token exists. `serverTimeMs` is the same instant as `serverTime` in epoch milliseconds. Nothing else is revealed without a token.
 
 ### `POST /v1/pair`
 
@@ -225,7 +230,13 @@ Request:
 { "code": "483-912", "clientName": "Companion app" }
 ```
 
-`clientName`: 1 to 60 characters, shown in the terminal and in the token list.
+`clientName`: 1 to 60 characters, shown in the terminal and in the token list. The code may be sent with or without the dash.
+
+Errors: `403 pairing_code_invalid` (wrong, expired or used; for an expired or used code a new one is printed), `429 pairing_rate_limited`, `422 validation_failed` (`clientName`).
+
+### `DELETE /v1/pair`
+
+Revokes the token in the `Authorization` header. Response `200` `{ "revoked": true }`.
 
 Response `200`:
 
@@ -253,13 +264,15 @@ Response `200`:
   ],
   "storage": { "archivePath": "/Users/.../archive", "freeBytes": 412316860416 },
   "limits": { "maxUploadBytes": 2147483648, "maxDurationSec": 36000, "jsonBodyBytes": 65536 },
-  "features": { "upload": true, "deleteAudio": true, "speakerMerge": true },
+  "features": { "upload": true, "deleteAudio": true, "speakerMerge": true, "multichannel": true },
   "recording": null,
   "orphans": []
 }
 ```
 
-`inputDevices[].channels` is the number of input channels the device offers (a multi-input interface reports more than 1; see [Multichannel recording](#multichannel-recording)). `storage.freeBytes` is the free space on the archive volume, so a client can warn before a long recording. `recording` is the active recording object (or `null`). `orphans` lists recordings left in `recording` state by a crashed process; `POST .../stop` on one analyses whatever audio was written.
+`inputDevices[].channels` is the number of input channels the device offers (a multi-input interface reports more than 1; see [Multichannel recording](#multichannel-recording)). `storage.freeBytes` is the free space on the archive volume, so a client can warn before a long recording. `recording` is the active recording object (or `null`): the one this server captures, or one that the app or the CLI is capturing right now. `orphans` lists recordings left in `recording` state by a process that is gone: a `recording` row not captured by this server whose audio file has not been written for 10 seconds. `POST .../stop` on an orphan repairs the WAV header and analyses whatever audio was written. While an orphan exists, starting a new recording answers `409 conflict_recording_active` with its id, so a client should offer to stop it.
+
+`defaultLanguage` is the archive's configured default (`auto` unless `DIARIZE_LANG_DEFAULT` says otherwise).
 
 ### `POST /v1/recordings`
 
@@ -310,7 +323,9 @@ Multichannel request (one input channel per person, see [Multichannel recording]
 | `transcribe` | `onStop`, `manual` | `onStop` | `manual` leaves the audio unanalysed until `POST .../transcribe`. |
 | `deleteAudioWhenDone` | bool | `false` | Delete the raw audio after a successful analysis. Persisted server-side; works even if the client has gone away. |
 
-Response `201`: a [Recording](#recording) with `state: "recording"`. The call returns once capture is running and `audioStartedAt` is known (normally under a second). Errors: `409 conflict_recording_active`, `422 capture_failed`, `422 validation_failed`, `507 insufficient_storage` (less than 2 GiB free on the archive volume), `503 models_unavailable` (only when `transcribe` is `onStop` and the models are missing, checked up front).
+Response `201`: a [Recording](#recording) with `state: "recording"`. The call returns once capture is running and `audioStartedAt` is known (normally under a second). Errors: `409 conflict_recording_active` (with `details.recordingId`), `422 capture_failed` (with `details.hint`), `422 validation_failed` (with `details.fields: [{field, message}]`), `507 insufficient_storage` (less than 2 GiB free on the archive volume, `details.freeBytes`), `503 models_unavailable` (only when `transcribe` is `onStop` and the engine reports the models cannot be loaded; the built-in pipeline downloads missing models on first use, so it does not refuse up front).
+
+The terminal prints one line per start: `Recording rec_... started by "<clientName>" from <origin> -> <file>`.
 
 ### `PATCH /v1/recordings/{id}`
 
@@ -318,7 +333,9 @@ Body: any of `title` (string 1..200), `clientMeta` (object, replaces the stored 
 
 ### `POST /v1/recordings/{id}/stop`
 
-No body. Response `202` with the Recording: `state: "analyzing"` for `transcribe: "onStop"`, `state: "stopped"` for `manual` (see [state](#recording)). Stopping a recording that is not in state `recording` returns `409 wrong_state`. Stopping an orphan (see `capabilities.orphans`) analyses the audio that was written before the crash.
+No body. Response `202` with the Recording: `state: "analyzing"` for `transcribe: "onStop"`, `state: "stopped"` for `manual` (see [state](#recording)), or `state: "failed"` when not a single sample was captured (`errorMessage` explains the permission settings). Stopping a recording that is not in state `recording` returns `409 wrong_state`.
+
+Accepted ids: the recording this server captures, and every id in `capabilities.orphans`. Stopping an orphan analyses the audio that was written before the crash. A recording that the app or the CLI is still capturing cannot be stopped here: `409 wrong_state` with `details.reason: "recording_in_other_process"`.
 
 ### `POST /v1/recordings/{id}/transcribe`
 
@@ -331,6 +348,8 @@ Query: `clientRef`, `state`, `limit` (default 20, max 200), `before` (ISO timest
 ```json
 { "recordings": [ { "...": "Recording without clock.syncPoints" } ], "nextBefore": null }
 ```
+
+List items carry `clock.audioStartedAt`, `audioStartedAtMs` and `audioStartedAtSource` but **no `clock.syncPoints`** (the key is absent): a long recording has hundreds of points. Fetch `GET /v1/recordings/{id}` or the transcript for them. `nextBefore` is the `before` value for the next page, or `null`. `state` filters by the API state (including `stopped`).
 
 ### `GET /v1/recordings/{id}`
 
@@ -360,7 +379,7 @@ Response `200`:
 }
 ```
 
-`transcript` is a superset of the JSON file written by `diarize` (`TranscriptDocument`): the same keys plus `segments[].id`, `segments[].channel` (1-based input channel for multichannel recordings, else `null`), `segments[].bleed` and `speakers[].channel`. Query `?includeBleed=true` to include segments classified as cross-talk (default: omitted when the recording used `bleed: "suppress"`). `409 not_ready` while `state` is `recording` or `analyzing`; `state: "empty"` returns an empty `segments` array.
+`transcript` is a superset of the JSON file written by `diarize` (`TranscriptDocument`): the same keys plus `segments[].id`, `segments[].channel` (1-based input channel for multichannel recordings, else `null`), `segments[].bleed` and `speakers[].channel` (the channel most of the speaker's segments came from, else `null`). Query `?includeBleed=true` to include segments classified as cross-talk (see [Multichannel recording](#multichannel-recording): the current implementation never classifies a segment as cross-talk, so the flag changes nothing yet). `409 not_ready` while `state` is `recording` or `analyzing`; `state: "empty"` returns an empty `segments` array. `recording.clock.syncPoints` is included.
 
 ### `DELETE /v1/recordings/{id}/audio`
 
@@ -368,7 +387,7 @@ Removes the raw audio file and marks `audioDeletedAt`, keeping transcript and sp
 
 ### `DELETE /v1/recordings/{id}?confirm=true`
 
-Deletes audio, transcript files and the row. Without `confirm=true`: `422 validation_failed`.
+Deletes audio (all channel files and the mixdown), transcript files, the sidecar and the row. Response `200` `{ "deleted": true }`. Without `confirm=true`: `422 validation_failed`. Not allowed while `recording` or `analyzing` (`409 wrong_state`).
 
 ### `POST /v1/transcriptions`
 
@@ -376,7 +395,8 @@ Upload audio for diarization and transcription (for example audio recorded elsew
 
 - Body: the raw audio bytes. `Content-Type`: `audio/wav`, `audio/x-wav`, `audio/mpeg`, `audio/mp4`, `audio/x-m4a`, or `application/octet-stream` (sniffed). The file is streamed to disk, never held in memory.
 - Query: `title`, `language` (`auto|de|en`), `clientRef`, `startedAt` (ISO or epoch ms; when the audio was *recorded*, becomes `clock.audioStartedAt` with source `client`), `deleteAudioWhenDone` (bool).
-- Response `202` with the Recording (`state: "analyzing"`). Errors: `413 payload_too_large`, `415 unsupported_media_type`.
+- Response `202` with the Recording (`state: "analyzing"`). Errors: `413 payload_too_large`, `415 unsupported_media_type` (content type not in the list, or the first bytes are not RIFF/WAVE, ID3 or an MPEG frame, or an MP4 `ftyp` box), `422 validation_failed` (query fields).
+- Uploads are exempt from the 64 KiB JSON limit; `capabilities.limits.maxUploadBytes` applies instead.
 
 The file is stored in `<archive>/recordings/` like any other recording.
 
@@ -393,7 +413,7 @@ The file is stored in `<archive>/recordings/` like any other recording.
 
 ### `PATCH /v1/speakers/{id}`
 
-Request: `{ "label": "Sam", "notes": "table left" }`. Either field may be `null` to clear it. Labels are global: they apply to every recording that contains this speaker. Response `200` with the Speaker.
+Request: `{ "label": "Sam", "notes": "table left" }`. Either field may be `null` (or an empty string) to clear it; an absent field is left unchanged. Labels are global: they apply to every recording that contains this speaker. Response `200` with the Speaker.
 
 ### `POST /v1/speakers/{id}/merge`
 
@@ -407,7 +427,7 @@ Request: `{ "into": "spk_c3" }`. Moves all voice embeddings and segments of `{id
 
 ```
 event: snapshot
-data: {"serverTime":1731607392123,"recording":{...Recording or null}}
+data: {"serverTime":"2026-11-14T18:03:12.123Z","serverTimeMs":1731607392123,"recording":{...Recording or null}}
 
 event: levels
 data: {"recordingId":"rec_9f1c","t":1731607400123,"mic":0.42,"system":null,"channels":null}
@@ -427,12 +447,12 @@ data: {"recordingId":"rec_9f1c","error":{"code":"internal","message":"..."}}
 
 | Event | When | Notes |
 | --- | --- | --- |
-| `snapshot` | on connect | Current recording (or `null`). |
-| `levels` | about 10 per second while a recording is running | Values 0..1, smoothed, perceptual scale. `null` for a source that is not captured. In multichannel mode `channels` is an array of `{ "channel": n, "level": 0..1 }` (and `mic` is the maximum), else `null`. |
-| `state` | every state transition | |
+| `snapshot` | on connect | Current recording (or `null`), `serverTime` (ISO) and `serverTimeMs` (epoch ms). |
+| `levels` | about 10 per second while a recording is running | Values 0..1, smoothed, perceptual scale. `null` for a source that is not captured. Single-source: `mic` and/or `system`, `channels: null`. Multichannel: `channels` is an array of `{ "channel": n, "level": 0..1 }`, one entry per mapped channel; `mic` is the **maximum of the channel levels** (a convenience for clients that draw one meter, not a separate measurement) and `system` is `null`. Clients that draw per-channel meters should use `channels` only. |
+| `state` | every state transition, and after `PATCH` or an audio delete | Recording without `clock.syncPoints`. |
 | `progress` | during analysis, throttled to about one per second | `step` is human readable (English); `fraction` is `null` when the pipeline cannot tell. |
 | `ready` | analysis finished (`done` or `empty`) | Fetch the transcript next. |
-| `error` | recording or analysis failed | The recording also moves to `state: "failed"` with `errorMessage`. |
+| `error` | recording or analysis failed | `error.code` is `capture_failed` (no samples) or `internal`. The recording also moves to `state: "failed"` with `errorMessage`. |
 
 Events carry no transcript text and no audio.
 
@@ -473,12 +493,12 @@ Events carry no transcript text and no audio.
 
 | Field | Notes |
 | --- | --- |
-| `state` | `recording`, `stopped` (capture over, analysis not started, only with `transcribe: "manual"`), `analyzing`, `done`, `empty` (no speech found), `failed`. Maps to the app's processing states; `stopped` is derived. |
+| `state` | `recording`, `stopped` (capture over, analysis not started, only with `transcribe: "manual"`), `analyzing`, `done`, `empty` (no speech found), `failed`. Maps to the app's processing states; `stopped` is derived: in the database (and the app) such a recording is `failed` with the message "Not analysed yet …", so the app offers to analyse it. A recording that was running when `diarize serve` was stopped with Ctrl-C is closed cleanly and also ends up `stopped`. |
 | `durationSec` | Live elapsed audio while recording; final audio duration afterwards. |
 | `progress` | `{ "step": string, "fraction": number or null, "t": epoch ms }` during analysis, else `null`. |
 | `clientMeta` | The opaque object given at start or via `PATCH`; `null` if none. |
 | `channels` | `null` for a single-source recording. For multichannel: `[ { "channel": 1, "label": "Anna", "key": "pc.anna", "bytes": 123456, "audioDeletedAt": null } ]`. |
-| `clock` | See [Time and clocks](#time-and-clocks). `syncPoints` only in single-recording and transcript responses. |
+| `clock` | See [Time and clocks](#time-and-clocks). `syncPoints` only in single-recording, start/stop/transcribe/patch and transcript responses; absent in list items and `state` events. |
 
 ### Speaker
 
@@ -504,7 +524,8 @@ The server therefore records a `clock` per recording it captures:
 
 - `audioStartedAt` / `audioStartedAtMs`: the wall-clock time at which audio position 0 was captured. It is determined right after the recorder has started by reading the number of samples already received and subtracting that from the current time. Precision is a few tens of milliseconds.
 - `audioStartedAtSource`: `recorder` (measured as above), `client` (given in an upload as `startedAt`), or `createdAt` (a recording that was not captured through this server, such as one made in the app; only coarse, can be off by a second or more).
-- `syncPoints`: the server samples `(wallMs, audioSec)` pairs about every 30 seconds while recording. A client maps an audio position to wall-clock time by linear interpolation between the neighbouring points, which absorbs microphone recoveries and similar gaps. With fewer than two points, use `audioStartedAtMs + audioSec * 1000`.
+- `syncPoints`: the server samples `(wallMs, audioSec)` pairs about every 30 seconds while recording, plus one at audio position 0 (`wallMs = audioStartedAtMs`) and one when capture stops. A client maps an audio position to wall-clock time by linear interpolation between the neighbouring points, which absorbs microphone recoveries and similar gaps. With fewer than two points, use `audioStartedAtMs + audioSec * 1000`.
+- If no sample arrives within 2 seconds of the recorder starting, `audioStartedAtMs` is the time the recorder returned (source still `recorder`); this is flagged in the sidecar as imprecise.
 
 All wall-clock values use the macOS system clock; a client on the same machine sees the same clock. If `durationSec` is clearly shorter than `stoppedAt - audioStartedAt` the Mac probably slept during recording; clients should warn.
 
@@ -514,15 +535,15 @@ A multichannel recording has **one** clock: all channels come from one device an
 
 ## Multichannel recording
 
-> Status: specified, not yet implemented (additive; single-source recordings behave exactly as above).
+> Status: implemented (capture, per-channel files, per-channel levels and delete, channel attribution). Per-channel analysis and cross-talk (bleed) detection are not implemented yet; see "Analyse" below.
 
 Today `diarize` records at most two channels: microphone (left) and system audio (right), analysed independently. Multichannel mode generalises the idea: **one input channel of a multi-input audio device is one person**. It is meant for a table where every participant has their own microphone (headset or lavalier) and the microphones arrive in the Mac as one multi-channel input device (a USB audio interface, a multitrack recorder in USB audio mode, or several devices combined into an aggregate device in Audio MIDI Setup). Hardware is not part of this API; any device that macOS lists as an input with more than one channel works.
 
 - **Discover**: `GET /v1/capabilities` lists `inputDevices[].channels`.
 - **Start**: `POST /v1/recordings` with `micDeviceUID` and `channelMap`. The server validates channels against the device and refuses with `422 validation_failed` (`details.fields`) otherwise.
 - **Capture**: one mono file per mapped channel, `<archive>/recordings/<recording>/ch01.wav` and so on, plus a 16 kHz mono mixdown `mix.wav` (the recording's primary audio file, so existing tools still have something to play). `captureQuality: "asr"` writes 16 kHz Float32 (about 0.23 GB per channel-hour); `"archive"` writes 16-bit PCM at the device rate, at most 48 kHz (about 0.35 GB per channel-hour at 48 kHz), and analysis resamples from it.
-- **Analyse**: each channel is analysed on its own (voice activity, diarization, transcription); the dominant speaker of a channel is that channel's person, further speakers in the same channel (someone leaning into the mic, a guest) get their own speaker ids. The results are merged by time. `segments[].channel` names the channel. Speaker ids still come from the global speaker library, so a voice stays recognisable if a person later uses a different channel.
-- **Cross-talk (bleed)**: with `bleed: "suppress"` a segment is marked `bleed: true` and left out of the merged transcript when, over most of its duration, another channel is clearly louder (short-term level comparison across channels). The segment stays retrievable with `?includeBleed=true`.
+- **Analyse** (as implemented): the 16 kHz mixdown is analysed like any recording (diarization, speaker matching against the global library, transcription), so every utterance is one segment. Afterwards each segment gets the channel whose microphone was loudest over the segment (RMS of the channel files), `segments[].channel`, and each speaker the channel most of its segments came from, `speakers[].channel`. Channels whose audio was deleted before the analysis are skipped.
+- **Cross-talk (bleed)**: because the mixdown yields one segment per utterance, there are no duplicate cross-talk segments to suppress; `bleed` is always `false` and `?includeBleed=true` changes nothing. The `bleed` request field is stored for a later per-channel analysis (planned: each channel analysed on its own, a segment marked `bleed: true` when another channel is clearly louder over most of its duration).
 - **Levels and clock**: `levels` events carry per-channel levels; one clock for all channels (see [Time and clocks](#time-and-clocks)).
 - **Delete**: `DELETE /v1/recordings/{id}/audio?channel=n` removes one person's audio only.
 
@@ -537,7 +558,8 @@ Out of scope for the first version: combining multichannel with system audio, mo
 - The server serialises analyses (one at a time, like the MCP server); starting several uploads queues them.
 - Microphone permission belongs to the process that runs `diarize serve` (for example Terminal). The first start shows the macOS prompt; if it was denied, `capture_failed` explains where to enable it.
 - Restarting the server does not lose anything: recording rows and sidecar clock data live in the archive. A recording left in `recording` state after a crash shows up under `capabilities.orphans`.
-- Sidecar data (client reference, clock, options) is stored as `<archive>/serve/<recordingId>.json` and does not touch the database schema.
+- Sidecar data (client reference, clock, options, channel map, segment channels) is stored as `<archive>/serve/<recordingId>.json` and does not touch the database schema. `<archive>/serve/instance-id` holds the `instanceId`.
+- Multichannel files live in `<archive>/recordings/rec-<timestamp>/` (`mix.wav`, `ch01.wav`, ...); single-source recordings are `<archive>/recordings/rec-<timestamp>.wav` like the app's.
 - The API is not meant to be exposed beyond the machine. There is no TLS and no LAN mode.
 
 ---
@@ -557,9 +579,11 @@ Reference cases for implementers and for the test suites (`H` = `Host`, `O` = `O
 | 7 | as 6 plus `Access-Control-Request-Private-Network: true` | 204 plus `Access-Control-Allow-Private-Network: true` |
 | 8 | as 6, O not allowed | 403, no CORS headers |
 | 9 | `GET /v1/capabilities`, no token | 401 `unauthorized` |
-| 10 | `GET /v1/capabilities`, T for origin A, O = B (also allowed) | 403 `forbidden_origin` |
-| 11 | `POST /v1/pair` right code | 200, token; the same code again: 403 `pairing_code_invalid` |
+| 10 | `GET /v1/capabilities`, T for origin A, O = B (also allowed) | 403 `forbidden_origin` with `Access-Control-Allow-Origin: B` |
+| 11 | `POST /v1/pair` right code | 200, token; the same code again: 403 `pairing_code_invalid` (and a new code is printed) |
 | 12 | `POST /v1/pair` wrong code x5 | 403 x4, then 429 `pairing_rate_limited` with `Retry-After` |
-| 13 | `POST /v1/recordings` while one runs | 409 `conflict_recording_active` |
+| 13 | `POST /v1/recordings` while one runs | 409 `conflict_recording_active` with `details.recordingId` |
 | 14 | `GET .../transcript` while `analyzing` | 409 `not_ready` |
 | 15 | `POST /v1/recordings` body of 70 KiB | 413 `payload_too_large` |
+| 16 | `POST /v1/recordings/{id}/stop` with an id from `capabilities.orphans` | 202 |
+| 17 | `GET /v1/recordings` | items without `clock.syncPoints` |
