@@ -78,7 +78,9 @@ struct BodyLimitMiddleware<Context: RequestContext>: RouterMiddleware {
     let maxBytes: Int
 
     func handle(_ request: Request, context: Context, next: (Request, Context) async throws -> Response) async throws -> Response {
-        if let raw = request.headers[Hdr.contentLength], let length = Int(raw), length > maxBytes {
+        // Uploads have their own, much larger limit (checked by the upload route while streaming).
+        let isUpload = request.method == .post && request.uri.path == "/v1/transcriptions"
+        if !isUpload, let raw = request.headers[Hdr.contentLength], let length = Int(raw), length > maxBytes {
             throw APIError.payloadTooLarge(limit: maxBytes)
         }
         return try await next(request, context)
@@ -137,13 +139,12 @@ public enum TokenCheck: Sendable, Equatable {
     case wrongOrigin
 }
 
-/// Token validation seam. Story 15.3 provides the real implementation (hashed token store, origin binding).
+/// Token validation seam. `TokenStore` is the real implementation (hashed tokens, origin binding).
 public protocol TokenValidator: Sendable {
     func check(token: String, origin: String?) async -> TokenCheck
 }
 
-/// TODO(15.3): replaced by the pairing-backed validator. Until then no token is ever valid,
-/// so every authenticated route answers 401.
+/// Rejects every token (every authenticated route answers 401).
 public struct RejectAllTokenValidator: TokenValidator {
     public init() {}
     public func check(token: String, origin: String?) async -> TokenCheck { .invalid }

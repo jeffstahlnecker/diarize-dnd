@@ -59,10 +59,12 @@ let package = Package(
             name: "DiarizeServerTests",
             dependencies: [
                 "DiarizeServer",
+                "DiarizeCore",
                 .product(name: "Hummingbird", package: "hummingbird"),
                 .product(name: "HummingbirdTesting", package: "hummingbird"),
                 .product(name: "HTTPTypes", package: "swift-http-types"),
                 .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "NIOConcurrencyHelpers", package: "swift-nio"),
             ],
             path: "Tests/DiarizeServerTests"
         ),

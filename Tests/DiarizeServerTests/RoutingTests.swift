@@ -11,7 +11,10 @@ import Testing
         #expect(r.json["apiVersion"] as? Int == 1)
         #expect(r.json["version"] as? String == ServeConfig.defaultVersion)
         #expect(r.json["paired"] as? Bool == false)
-        #expect(r.json["serverTime"] is String)
+        // Mismatch 2: serverTime is ISO everywhere; serverTimeMs carries the same instant as epoch ms.
+        let iso = try #require(r.json["serverTime"] as? String)
+        let ms = try #require(r.json["serverTimeMs"] as? Int64)
+        #expect(WallClock.ms(try #require(ISOTime.parse(iso))) == ms)
         #expect(r.header("Content-Type")?.hasPrefix("application/json") == true)
     }
 
@@ -35,10 +38,10 @@ import Testing
         #expect(requestId == r.header("X-Request-Id"))
     }
 
-    @Test func pairIsPublicButNotImplementedYet() async throws {
-        let r = try await send(.post, "/v1/pair", headers: ["Content-Type": "application/json"], body: "{}")
-        #expect(r.status == 501)
-        #expect(r.errorCode == "not_implemented")
+    @Test func pairIsPublic() async throws {
+        let r = try await send(.post, "/v1/pair", headers: ["Content-Type": "application/json"], body: #"{"code":"000-000","clientName":"x"}"#)
+        #expect(r.status == 403)
+        #expect(r.errorCode == "pairing_code_invalid")
     }
 
     @Test func capabilitiesNeedsTokenAndReturnsJSON() async throws {
@@ -60,7 +63,8 @@ import Testing
 
     @Test func bindsLoopbackOnly() throws {
         #expect(ServeConfig.bindHost == "127.0.0.1")
-        let app = DiarizeHTTPServer.makeApplication(config: try makeTestConfig())
+        let server = try TestServer()
+        let app = DiarizeHTTPServer.makeApplication(config: server.config, services: server.services)
         #expect(app.configuration.address == .hostname("127.0.0.1", port: testPort))
     }
 
