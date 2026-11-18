@@ -51,8 +51,9 @@ func send(
     if let host { fields[Hdr.host] = host }
     for (k, v) in extra { fields[HTTPField.Name(k)!] = v }
     let buffer = body.map { ByteBuffer(string: $0) }
+    let headers = fields
     return try await app.test(.router) { client in
-        try await client.execute(uri: uri, method: method, headers: fields, body: buffer) { response in
+        try await client.execute(uri: uri, method: method, headers: headers, body: buffer) { response in
             Reply(
                 status: Int(response.status.code),
                 headers: response.headers,

@@ -51,8 +51,8 @@ import Testing
     @Test func oversizedBodyIsRejected() async throws {
         let r = try await send(
             .post, "/v1/pair",
-            headers: ["Content-Length": "\(70 * 1024)", "Content-Type": "application/json"],
-            body: "{}"
+            headers: ["Content-Type": "application/json"],
+            body: "{\"pad\":\"" + String(repeating: "x", count: 70 * 1024) + "\"}"
         )
         #expect(r.status == 413)
         #expect(r.errorCode == "payload_too_large")
@@ -61,13 +61,7 @@ import Testing
     @Test func bindsLoopbackOnly() throws {
         #expect(ServeConfig.bindHost == "127.0.0.1")
         let app = DiarizeHTTPServer.makeApplication(config: try makeTestConfig())
-        switch app.configuration.address {
-        case .hostname(let host, let port):
-            #expect(host == "127.0.0.1")
-            #expect(port == testPort)
-        default:
-            Issue.record("server must bind to a hostname address, not a socket path")
-        }
+        #expect(app.configuration.address == .hostname("127.0.0.1", port: testPort))
     }
 
     @Test func defaultPortAndEnvResolution() {

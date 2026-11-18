@@ -47,7 +47,7 @@ struct ErrorEnvelopeMiddleware<Context: RequestContext>: RouterMiddleware {
         do {
             return try await next(request, context)
         } catch {
-            if !(error is APIError) {
+            if !(error is APIError), !(error is any HTTPResponseError) {
                 context.logger.error("unhandled error: \(error)")
             }
             return ErrorRendering.response(for: error, requestID: request.headers[Hdr.requestID] ?? "-")
